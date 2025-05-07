@@ -1,3 +1,7 @@
 name = "cf-bot"
 main = "src/worker.js"
 compatibility_date = "2025-05-05"
+workers_dev = true
+
+[observability]
+enabled = true
