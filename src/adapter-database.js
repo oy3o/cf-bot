@@ -7,5 +7,5 @@ export const put = cf.putKvNamespaceValue
 export const del = cf.delKvNamespaceValue
 
 
-export const getUser = async (userid, env) => env.data.get(userid)
-export const putUser = async (userid, user, env) => env.data.put(userid, JSON.stringify(user))
+export const getUser = async (userid, env) => env.chat.get(userid)
+export const putUser = async (userid, user, env) => env.chat.put(userid, JSON.stringify(user))

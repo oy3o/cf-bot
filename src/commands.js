@@ -2,6 +2,7 @@ import * as db from './adapter-database.js'
 import * as bot from './adapter-telegram.js'
 import command_env from './command-env.js'
 import command_db from './command-db.js'
+import command_google from './command-google.js'
 
 class Commands {
     #commands = new Map()
@@ -140,6 +141,7 @@ class Commands {
 
         this.register(...command_env)
         this.register(...command_db)
+        this.register(...command_google)
     }
 }
 

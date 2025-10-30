@@ -16,6 +16,7 @@ export class User {
             // Public BOT Cloudflare
             this.CF_ACCOUNT_ID = null
             this.CF_API_TOKEN = null
+            this.GOOGLE_JWT = null
         }
     }
 }

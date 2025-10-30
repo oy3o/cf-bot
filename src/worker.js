@@ -7,7 +7,7 @@ import commands from './commands.js'
 //import gemini from './bot-gemini.js'
 //import mistral from './bot-mistral.js'
 import { User, Chat } from './chat.js'
-import html_404 from './404.js'
+import {html_404,html_oauth2_callbcak} from './html.js'
 
 function OK(payload = '') { return new Response(payload, { status: 200, headers: config.corsHeaders }) }
 function Created(payload = '') { return new Response(payload, { status: 201, headers: config.corsHeaders }) }
@@ -35,6 +35,153 @@ for (const command of [
 ]) commands.register(...command)
 commands.registerDefault()
 
+async function HandleMessage(req, env, ctx) {
+    if (req.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.BOT_SECRET) return Unauthorized()
+
+    const tgRequest = await req.json()
+
+    if (tgRequest.message) {
+        const tgMessage = tgRequest.message
+        const newMember = tgMessage.new_chat_member
+        if (newMember) {
+            //ctx.waitUntil(bot.sendMessage(tgMessage.chat_id, `欢迎加入群组 @${newMember.username}`, env))
+            return OK()
+        }
+
+        const text = tgMessage.text
+        const context = {
+            sudo: tgMessage.from.id === env.BOT_ADMIN,
+            isbot: tgMessage.from.is_bot,
+            date: tgMessage.date,
+            chattype: tgMessage.chat.type,
+            chatid: tgMessage.chat.id,
+            userid: tgMessage.from.id,
+            username: tgMessage.from.username,
+            messageid: tgMessage.message_id,
+            text: tgMessage.text,
+            audio: tgMessage.audio?.file_id || null,
+            document: tgMessage.document?.file_id || null,
+            photo: tgMessage.photo?.pop()?.file_id || null,
+            video: tgMessage.video?.file_id || null,
+            voice: tgMessage.voice?.file_id || null,
+        }
+
+        const user = new User(await db.getUser(context.userid, env) || context)
+        const chat = new Chat(user.chats[context.chatid] || config.DefaultChatContext)
+
+        context.user = user
+        context.chat = chat
+
+        if ((env.BOT_IS_PUBLIC || context.sudo) && text[0] === '/') {
+            const [instr, args] = splitByFirst(text, ' ')
+            ctx.waitUntil(commands.execute(instr, args, context, env))
+            return OK()
+        }
+
+        if (env.BOT_IS_PUBLIC || context.sudo) {
+            const chat = context.chat
+            const waiting = chat.waiting
+            waiting && context[waiting.type] && ctx.waitUntil(waiting.reply(context[waiting.type], context, env))
+        }
+
+        return OK()
+    }
+
+    if (tgRequest.callback_query) {
+        const callbackQuery = tgRequest.callback_query
+        const data = callbackQuery.data
+        const tgMessage = callbackQuery.message
+        const context = {
+            sudo: callbackQuery.from.id === env.BOT_ADMIN,
+            isbot: tgMessage.from.is_bot,
+            date: tgMessage.date,
+            chattype: tgMessage.chat.type,
+            chatid: tgMessage.chat.id,
+            userid: callbackQuery.from.id,
+            username: callbackQuery.from.username,
+            messageid: tgMessage.message_id,
+        }
+
+        const user = new User(await db.getUser(context.userid, env) || context)
+        const chat = new Chat(user.chats[context.chatid] || config.DefaultChatContext)
+
+        context.user = user
+        context.chat = chat
+
+        if (data.startsWith('!0,') && data.endsWith(',"close"'))
+            ctx.waitUntil(bot.deleteMessage(context.chatid, context.messageid, env))
+        const waiting = context.chat.waiting
+
+        waiting ?
+            ctx.waitUntil(waiting.reply(data, context, env)) :
+            ctx.waitUntil(async () => {
+                const res = await bot.sendMessage(context.chatid, `@${context.username} 不支持的操作`, env)
+                if (res.ok) {
+                    await Sleep(3000)
+                    return bot.deleteMessage(context.chatid, res.result.message.message_id, env)
+                }
+            })
+    }
+
+    if (tgRequest.edited_message) {
+
+    }
+
+    return OK()
+
+}
+
+async function HandleGoogleOauth(url, env, ctx) {
+    const params = url.searchParams;
+    const code = params.get('code');
+    const state = params.get('state'); // state 就是我们的 userid
+
+    if (!code || !state) {
+        return BadRequest('Missing code or state parameter.');
+    }
+
+    const userid = state;
+
+    try {
+        // 1. 用 code 换取 token
+        const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({
+                code: code,
+                client_id: env.GOOGLE_CLIENT_ID,
+                client_secret: env.GOOGLE_CLIENT_SECRET,
+                redirect_uri: `${env.CF_WORKER_ENDPOINT}/google-oauth-callback`,
+                grant_type: 'authorization_code',
+            }),
+        });
+
+        if (!tokenResponse.ok) {
+            const errorText = await tokenResponse.text();
+            await bot.sendMessage(userid, `Google 认证失败: ${errorText}`, env);
+            return ServerError(`Failed to fetch token: ${errorText}`);
+        }
+
+        const tokens = await tokenResponse.json();
+
+        // 2. 将 token 保存到用户数据中
+        const user = new User(await db.getUser(userid, env) || { userid });
+        user.google_auth = tokens;
+        await db.putUser(userid, user, env);
+
+        // 3. 通知用户成功
+        ctx.waitUntil(bot.sendMessage(userid, `🎉 Google 账户已成功关联！\n<pre>${JSON.stringify(tokens, null, 2)}</pre>`, env))
+
+        // 4. 给浏览器返回一个成功页面
+        return new Response(html_oauth2_callbcak, { headers: { 'Content-Type': 'text/html' } });
+    } catch (e) {
+        ctx.waitUntil(bot.sendMessage(userid, `处理 Google 回调时发生内部错误: ${e.message}`, env));
+        return ServerError(e.message);
+    }
+}
+
 export default {
     fetch: async (req, env, ctx) => {
         if (req.method === 'OPTIONS') return OK()
@@ -42,99 +189,9 @@ export default {
         const url = new URL(req.url)
         const module = url.pathname.split('/')[1]
 
-        if (module === 'message') {
-            if (req.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.BOT_SECRET) return Unauthorized()
-
-            const tgRequest = await req.json()
-
-            if (tgRequest.message) {
-                const tgMessage = tgRequest.message
-                const newMember = tgMessage.new_chat_member
-                if (newMember) {
-                    //ctx.waitUntil(bot.sendMessage(tgMessage.chat_id, `欢迎加入群组 @${newMember.username}`, env))
-                    return OK()
-                }
-
-                const text = tgMessage.text
-                const context = {
-                    sudo: tgMessage.from.id === env.BOT_ADMIN,
-                    isbot: tgMessage.from.is_bot,
-                    date: tgMessage.date,
-                    chattype: tgMessage.chat.type,
-                    chatid: tgMessage.chat.id,
-                    userid: tgMessage.from.id,
-                    username: tgMessage.from.username,
-                    messageid: tgMessage.message_id,
-                    text: tgMessage.text,
-                    audio: tgMessage.audio?.file_id || null,
-                    document: tgMessage.document?.file_id || null,
-                    photo: tgMessage.photo?.pop()?.file_id || null,
-                    video: tgMessage.video?.file_id || null,
-                    voice: tgMessage.voice?.file_id || null,
-                }
-
-                const user = new User(await db.getUser(context.userid, env) || context)
-                const chat = new Chat(user.chats[context.chatid] || config.DefaultChatContext)
-
-                context.user = user
-                context.chat = chat
-
-                if ((env.BOT_IS_PUBLIC || context.sudo) && text[0] === '/') {
-                    const [instr, args] = splitByFirst(text, ' ')
-                    ctx.waitUntil(commands.execute(instr, args, context, env))
-                    return OK()
-                }
-
-                if (env.BOT_IS_PUBLIC || context.sudo) {
-                    const chat = context.chat
-                    const waiting = chat.waiting
-                    waiting && context[waiting.type] && ctx.waitUntil(waiting.reply(context[waiting.type], context, env))
-                }
-
-                return OK()
-            }
-
-            if (tgRequest.callback_query) {
-                const callbackQuery = tgRequest.callback_query
-                const data = callbackQuery.data
-                const tgMessage = callbackQuery.message
-                const context = {
-                    sudo: callbackQuery.from.id === env.BOT_ADMIN,
-                    isbot: tgMessage.from.is_bot,
-                    date: tgMessage.date,
-                    chattype: tgMessage.chat.type,
-                    chatid: tgMessage.chat.id,
-                    userid: callbackQuery.from.id,
-                    username: callbackQuery.from.username,
-                    messageid: tgMessage.message_id,
-                }
-
-                const user = new User(await db.getUser(context.userid, env) || context)
-                const chat = new Chat(user.chats[context.chatid] || config.DefaultChatContext)
-
-                context.user = user
-                context.chat = chat
-
-                if (data.startsWith('!0,') && data.endsWith(',"close"'))
-                    ctx.waitUntil(bot.deleteMessage(context.chatid, context.messageid, env))
-                const waiting = context.chat.waiting
-
-                waiting ?
-                    ctx.waitUntil(waiting.reply(data, context, env)) :
-                    ctx.waitUntil(async () => {
-                        const res = await bot.sendMessage(context.chatid, `@${context.username} 不支持的操作`, env)
-                        if (res.ok) {
-                            await Sleep(3000)
-                            return bot.deleteMessage(context.chatid, res.result.message.message_id, env)
-                        }
-                    })
-            }
-
-            if (tgRequest.edited_message) {
-
-            }
-
-            return OK()
+        switch (module) {
+            case 'message': return HandleMessage(req, env, ctx)
+            case 'google-oauth-callback': return HandleGoogleOauth(url, env, ctx)
         }
 
         const params = new URLSearchParams(url.search)
